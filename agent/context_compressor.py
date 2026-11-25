@@ -62,7 +62,7 @@ from session_rules.turns import (
     _BACKGROUND_PROCESS_NOTIFICATION_PREFIX,
     _DB_PERSISTED_MARKER,
     _HISTORICAL_SUMMARY_PREFIXES,
-    _IMAGE_PART_TYPES, _VIDEO_PART_TYPES,
+    _IMAGE_PART_TYPES, _VIDEO_PART_TYPES, _AUDIO_PART_TYPES, _DOCUMENT_PART_TYPES, _ALL_MEDIA_PART_TYPES,
     _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
     _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER,
@@ -1330,11 +1330,14 @@ def _append_text_to_content(content: Any, text: str, *, prepend: bool = False) -
 
 
 def _replace_image_parts(parts: Any, placeholder: str) -> Optional[list[Any]]:
-    """New parts list with every image/video part replaced by a text placeholder; None if none."""
+    """New parts list with every media part replaced by a text placeholder; None if none."""
     if not isinstance(parts, list) or not any(_is_image_part(p) for p in parts):
         return None
-    video_placeholder = placeholder.replace("screenshot", "video").replace("image", "video")
-    return [({"type": "text", "text": video_placeholder if p.get("type") in _VIDEO_PART_TYPES else placeholder} if _is_image_part(p) else p) for p in parts]
+    def _ph(p: Any) -> str:
+        t = p.get("type") if isinstance(p, dict) else None
+        lbl = "video" if t in _VIDEO_PART_TYPES else ("audio" if t in _AUDIO_PART_TYPES else ("document" if t in _DOCUMENT_PART_TYPES else ""))
+        return placeholder.replace("screenshot", lbl).replace("image", lbl) if lbl else placeholder
+    return [({"type": "text", "text": _ph(p)} if _is_image_part(p) else p) for p in parts]
 
 
 def _tool_result_parts(content: Any) -> Any:
@@ -1348,11 +1351,11 @@ def _tool_content_has_images(content: Any) -> bool:
 
 
 def _strip_images_from_tool_msg(msg: dict[str, Any]) -> Optional[dict[str, Any]]:
-    """Copy of a tool message with image payloads replaced (stale ``api_content`` dropped); ``None`` if nothing to strip."""
+    """Copy of a tool message with media payloads replaced (stale ``api_content`` dropped); ``None`` if nothing to strip."""
     content = msg.get("content")
     if isinstance(content, dict) and content.get("_multimodal"):
-        is_vid = bool((content.get("meta") or {}).get("native_video")) or any(isinstance(p, dict) and p.get("type") in _VIDEO_PART_TYPES for p in (content.get("content") or []))
-        tag = "video" if is_vid else "screenshot"
+        meta, inner = content.get("meta") or {}, content.get("content") or []
+        tag = next((k for k, f, s in (("video", "native_video", _VIDEO_PART_TYPES), ("audio", "native_audio", _AUDIO_PART_TYPES), ("document", "native_document", _DOCUMENT_PART_TYPES)) if meta.get(f) or any(isinstance(p, dict) and p.get("type") in s for p in inner)), "screenshot")
         summary = content.get("text_summary") or f"[{tag} removed to save context]"
         return _rewritten(msg, f"[{tag} removed] {str(summary)[:200]}")
     stripped = _replace_image_parts(content, "[screenshot removed to save context]")
@@ -1391,24 +1394,18 @@ def _retire_stale_tool_result_images(
     return pruned
 
 
-def _image_payload(msg: dict[str, Any]) -> list[str]:
-    """Data URL / base64 string of each image block in a message (``""`` when unmeasurable).
-
-    The provider counts BLOCKS (one ``tool_result`` with three screenshots is three), so the
-    block count is the list length. Bytes are the summed string lengths: the payload is ASCII and
-    the JSON framing around it is noise against a 24 MB budget. The strings also let the caller
-    read dimensions from headers only, without a second walk or a full decode.
-    """
+def _image_payload(msg: dict[str, Any], *, images_only: bool = False) -> list[str]:
+    """Data URL / base64 string of each media block in a message (``""`` when unmeasurable)."""
     parts = _tool_result_parts(msg.get("content"))
     if not isinstance(parts, list):
         return []
     sources: list[str] = []
     for p in parts:
-        if not _is_image_part(p):
+        if not (_is_image_part(p) and (not images_only or p.get("type") in _IMAGE_PART_TYPES)):
             continue
-        media = p.get("image_url") or p.get("video_url") or p.get("input_video")
-        source = p.get("source")
-        data = (media.get("url") if isinstance(media, dict) else media) or (source.get("data") if isinstance(source, dict) else None)
+        m = p.get("image_url") or p.get("video_url") or p.get("input_video") or p.get("audio_url") or p.get("document_url")
+        s, ia, fo = p.get("source"), p.get("input_audio"), p.get("file")
+        data = (m.get("url") if isinstance(m, dict) else m) or (s.get("data") if isinstance(s, dict) else None) or (ia.get("data") if isinstance(ia, dict) else None) or (fo.get("file_data") if isinstance(fo, dict) else None) or p.get("data")
         sources.append(data if isinstance(data, str) else "")
     return sources
 
@@ -1442,7 +1439,10 @@ def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]], retired
         len(reserved),
         carrier_bytes_newest_first=[sum(map(len, sources)) for _, sources in carriers],
         reserved_bytes=sum(map(len, reserved)),
-        many_image_safe=images_all_within_many_image_limit([x for x in (*reserved, *(s for _, ss in carriers for s in ss)) if not x.startswith("data:video/")]),
+        many_image_safe=images_all_within_many_image_limit([
+            s for m in api_messages if isinstance(m, dict)
+            for s in _image_payload(m, images_only=True)
+        ]),
     )
     retire = latched_retire_count(retire, [api_messages[i].get("tool_call_id") for i, _ in carriers], retired_ids)
     pruned = 0
@@ -1455,8 +1455,8 @@ def evict_stale_outbound_tool_images(api_messages: list[dict[str, Any]], retired
 
 
 def _is_image_part(part: Any) -> bool:
-    """True if ``part`` is an image or video block (``image_url``, ``video_url``, ``input_video``, ...)."""
-    return isinstance(part, dict) and (part.get("type") in _IMAGE_PART_TYPES or part.get("type") in _VIDEO_PART_TYPES)
+    """True if ``part`` is a native media block (image, video, audio, or document)."""
+    return isinstance(part, dict) and part.get("type") in _ALL_MEDIA_PART_TYPES
 
 
 def _content_has_images(content: Any) -> bool:
